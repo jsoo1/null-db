@@ -1,21 +1,21 @@
 use crate::errors::NullDbReadError;
-use crate::file::{FileEngine, Record};
+use crate::file::{file_engine::FileEngine, record::Record};
 use crate::index;
 use crate::index::*;
-use crate::EasyReader;
 use crate::raft::raft::LogEntry;
+use crate::EasyReader;
 use crate::{errors, file_compactor, utils};
 use actix_web::web::Data;
 use anyhow::anyhow;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs::OpenOptions;
-use std::io::{prelude::*, self};
 use std::io::BufRead;
+use std::io::{self, prelude::*};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, RwLockWriteGuard};
 use std::sync::RwLock;
+use std::sync::{mpsc, RwLockWriteGuard};
 use std::time;
 use std::{fs::File, io::BufReader};
 
@@ -96,7 +96,11 @@ impl NullDB {
         };
         let encoding = config.encoding.clone();
         let file_engine = FileEngine::new(encoding.as_str());
-        let indexes = RwLock::new(generate_indexes(config.path.as_path(), &main_log, file_engine.clone())?);
+        let indexes = RwLock::new(generate_indexes(
+            config.path.as_path(),
+            &main_log,
+            file_engine.clone(),
+        )?);
         Ok(NullDB {
             main_log_mutex: RwLock::new(main_log),
             main_log_file_mutex: RwLock::new(false),
@@ -108,7 +112,7 @@ impl NullDB {
         })
     }
 
-    fn create_next_segment_file(path: &Path) -> anyhow::Result<PathBuf,io::Error> {
+    fn create_next_segment_file(path: &Path) -> anyhow::Result<PathBuf, io::Error> {
         let time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -130,8 +134,11 @@ impl NullDB {
     }
 
     // Deletes a record from the log
-    pub fn delete_record(&self, key: String) -> anyhow::Result<(),NullDbReadError> {
-        self.write_value_to_log(self.file_engine.new_tombstone_record(key, self.current_raft_index.load(Ordering::Relaxed)))
+    pub fn delete_record(&self, key: String) -> anyhow::Result<(), NullDbReadError> {
+        self.write_value_to_log(
+            self.file_engine
+                .new_tombstone_record(key, self.current_raft_index.load(Ordering::Relaxed)),
+        )
     }
 
     pub fn get_latest_record_from_disk(&self) -> Result<Record, errors::NullDbReadError> {
@@ -285,18 +292,30 @@ impl NullDB {
         Err(errors::NullDbReadError::ValueNotFound)
     }
 
-    pub fn log(&self, key: String, value: String, index: u64) -> anyhow::Result<(),NullDbReadError> {
+    pub fn log(
+        &self,
+        key: String,
+        value: String,
+        index: u64,
+    ) -> anyhow::Result<(), NullDbReadError> {
         let tmp_index = index + 1;
-        let new_record = self.file_engine.new_record(key, tmp_index, None, Some(value));
+        let new_record = self
+            .file_engine
+            .new_record(key, tmp_index, None, Some(value));
         self.write_value_to_log(new_record)?;
         Ok(())
     }
 
-    pub fn log_entries(&self, entries: Vec<LogEntry>, index: u64) -> anyhow::Result<(),NullDbReadError> {
-        
+    pub fn log_entries(
+        &self,
+        entries: Vec<LogEntry>,
+        index: u64,
+    ) -> anyhow::Result<(), NullDbReadError> {
         let mut tmp_index = index + 1;
         for entry in entries {
-            let new_record = self.file_engine.new_record(entry.key, tmp_index, None, Some(entry.value));
+            let new_record =
+                self.file_engine
+                    .new_record(entry.key, tmp_index, None, Some(entry.value));
             self.write_value_to_log(new_record)?;
             tmp_index += 1;
         }
@@ -305,7 +324,7 @@ impl NullDB {
     }
 
     // Writes value to log, will create new log if over 64 lines.
-    pub fn write_value_to_log(&self, record: Record) -> anyhow::Result<(),NullDbReadError> {
+    pub fn write_value_to_log(&self, record: Record) -> anyhow::Result<(), NullDbReadError> {
         let line_count;
         {
             let main_log = self.main_log_mutex.read();
@@ -328,7 +347,9 @@ impl NullDB {
             let Ok(mut main_log) = main_log else {
                 return Err(NullDbReadError::FailedToObtainMainLog);
             };
-            let Some(index) = index::generate_index_for_segment(&main_log,self.file_engine.clone()) else {
+            let Some(index) =
+                index::generate_index_for_segment(&main_log, self.file_engine.clone())
+            else {
                 panic!("could not create index of main log");
             };
             self.add_index(main_log.clone(), index);
@@ -371,15 +392,15 @@ impl NullDB {
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
-            .open(main_log_name.clone()).map_err(|e| {
+            .open(main_log_name.clone())
+            .map_err(|e| {
                 println!("Could not open main log file! error: {}", e);
                 NullDbReadError::IOError(e)
             })?;
 
-
         // TODO: Could write partial record to file then fail. need to try and clean up disk
         let rec = record.serialize();
-        let ret = file.write_all(rec.as_slice()); 
+        let ret = file.write_all(rec.as_slice());
 
         if let Err(e) = ret {
             return file_write_error(&mut main_log_memory, old_value, record, e);
@@ -417,7 +438,12 @@ impl NullDB {
     }
 }
 
-fn file_write_error(main_log:&mut RwLockWriteGuard<HashMap<String,Record>>, old_value: Option<Record>, record: Record ,e: io::Error) -> Result<(),NullDbReadError>{
+fn file_write_error(
+    main_log: &mut RwLockWriteGuard<HashMap<String, Record>>,
+    old_value: Option<Record>,
+    record: Record,
+    e: io::Error,
+) -> Result<(), NullDbReadError> {
     // TODO: Could write partial record to file then fail. need to try and clean up disk
     println!("Could not open main log file! error: {}", e);
     // If we failed to write to disk, reset the memory to what it was before
@@ -456,7 +482,7 @@ pub fn get_value_from_database(
     value: String,
     file_engine: &FileEngine,
 ) -> anyhow::Result<Record, errors::NullDbReadError> {
-    file_engine.get_record_from_str(&value).map_err(|e| {
+    file_engine.deserialize(&value).map_err(|e| {
         println!("Could not parse value from database! error: {}", e);
         errors::NullDbReadError::Corrupted
     })
@@ -466,7 +492,7 @@ pub fn get_key_from_database_line(
     value: String,
     file_engine: FileEngine,
 ) -> anyhow::Result<String, errors::NullDbReadError> {
-    Ok(file_engine.get_record_from_str(&value)?.get_key())
+    Ok(file_engine.deserialize(&value)?.get_key())
 }
 
 pub fn check_file_for_key(key: String, file: File) -> Result<String, errors::NullDbReadError> {

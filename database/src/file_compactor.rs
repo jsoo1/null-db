@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use crate::index::generate_index_for_segment;
 use crate::nulldb::NullDB;
 
-use super::record;
+use super::file::record;
 use super::utils;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -136,7 +136,7 @@ pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
                         // need to use our hashing object so only the "key" is looked at. pretty cool.
                         // have no idea why i'm so excited about this one single bit.
                         // this is what makes software engineering fun.
-                        if let Some(record) = record::Record::new(l) {
+                        if let Ok(record) = db.get_file_engine().deserialize(&l) {
                             data.replace(record);
                         }
                     }
@@ -161,12 +161,15 @@ pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
                     // interesting we don't "care" about the order now
                     // becuase all records are unique
                     for r in data.iter() {
-                        if let Err(e) = writeln!(new_file, "{}", r.get_string()) {
+                        let rec = r.serialize();
+                        if let Err(e) = new_file.write_all(rec.as_slice()) {
                             eprintln!("Couldn't write to file: {}", e);
                         }
                     }
 
-                    let Some(index) = generate_index_for_segment(&new_segment_name, db.get_file_engine()) else {
+                    let Some(index) =
+                        generate_index_for_segment(&new_segment_name, db.get_file_engine())
+                    else {
                         panic!("could not generate index of compacted file");
                     };
                     db.add_index(new_segment_name.clone(), index);
@@ -210,12 +213,14 @@ pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
         // interesting we don't "care" about the order now
         // becuase all records are unique
         for r in data.iter() {
-            if let Err(e) = writeln!(new_file, "{}", r.get_string()) {
+            let rec = r.serialize();
+            if let Err(e) = new_file.write_all(rec.as_slice()) {
                 eprintln!("Couldn't write to file: {}", e);
             }
         }
 
-        let Some(index) = generate_index_for_segment(&new_segment_name, db.get_file_engine()) else {
+        let Some(index) = generate_index_for_segment(&new_segment_name, db.get_file_engine())
+        else {
             panic!("failed to create index for new log segment");
         };
         db.add_index(new_segment_name.clone(), index);

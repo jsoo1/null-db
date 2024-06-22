@@ -1,4 +1,4 @@
-use crate::file::FileEngine;
+use crate::file::file_engine::FileEngine;
 use crate::{errors, nulldb};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -59,7 +59,10 @@ pub fn generate_indexes(
     Ok(indexes)
 }
 
-pub fn generate_index_for_segment(segment_path: &PathBuf, file_engine: FileEngine) -> Option<Index> {
+pub fn generate_index_for_segment(
+    segment_path: &PathBuf,
+    file_engine: FileEngine,
+) -> Option<Index> {
     let mut index = Index::new();
 
     println!(

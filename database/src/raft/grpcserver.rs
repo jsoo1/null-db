@@ -1,9 +1,9 @@
+use log::info;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
-use log::info;
 
-use crate::{file::Record, errors::NullDbReadError};
+use crate::{errors::NullDbReadError, file::record::Record};
 
 use super::raft::{AppendEntriesReply, AppendEntriesRequest, VoteReply, VoteRequest};
 
@@ -17,9 +17,9 @@ pub enum RaftEvent {
     NewEntry {
         key: String,
         value: String,
-        sender: oneshot::Sender<Result<(),NullDbReadError>>,
+        sender: oneshot::Sender<Result<(), NullDbReadError>>,
     },
-    GetEntry(String, oneshot::Sender<Result<Record,NullDbReadError>>),
+    GetEntry(String, oneshot::Sender<Result<Record, NullDbReadError>>),
 }
 
 #[tonic::async_trait]

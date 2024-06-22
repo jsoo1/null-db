@@ -1,6 +1,6 @@
-use std::path::PathBuf;
 use env_logger;
 use errors::NullDbReadError;
+use std::path::PathBuf;
 
 use crate::nulldb::create_db;
 use actix_web::{
@@ -22,7 +22,6 @@ mod file_compactor;
 mod index;
 mod nulldb;
 mod raft;
-mod record;
 mod utils;
 
 #[derive(Parser, Debug)]
@@ -92,12 +91,11 @@ async fn get_value_for_key(
         Err(e) => {
             HttpResponse::InternalServerError().body(format!("Issue getting value for key: {}", e))
         }
-        Ok(value) => {
-            match value {
-                Ok(res) => HttpResponse::Ok().body(res.get_value().unwrap_or("No Value".to_string())),
-                Err(e) => HttpResponse::InternalServerError().body(format!("Issue getting value for key: {}", e)),
-            }
-        }
+        Ok(value) => match value {
+            Ok(res) => HttpResponse::Ok().body(res.get_value().unwrap_or("No Value".to_string())),
+            Err(e) => HttpResponse::InternalServerError()
+                .body(format!("Issue getting value for key: {}", e)),
+        },
     }
 }
 
@@ -125,17 +123,15 @@ pub async fn put_value_for_key(
 
     match ret {
         Err(e) => HttpResponse::InternalServerError().body(format!("Issue writing: {}", e)),
-        Ok(res) => {
-            match res {
-                Ok(_) => HttpResponse::Ok().body("Record written".to_string()),
-                Err(e) => {
-                    match e {
-                        NullDbReadError::NotLeader => HttpResponse::MisdirectedRequest().body("I'm not the leader"),
-                        _ => HttpResponse::InternalServerError().body(format!("Issue writing")),
-                    }
+        Ok(res) => match res {
+            Ok(_) => HttpResponse::Ok().body("Record written".to_string()),
+            Err(e) => match e {
+                NullDbReadError::NotLeader => {
+                    HttpResponse::MisdirectedRequest().body("I'm not the leader")
                 }
-            }
-        }
+                _ => HttpResponse::InternalServerError().body(format!("Issue writing")),
+            },
+        },
     }
 }
 
@@ -169,8 +165,7 @@ mod tests {
     use std::path;
     use std::path::PathBuf;
 
-    use crate::file::FileEngine;
-    use crate::file::Record;
+    use crate::file::{file_engine::FileEngine, record::Record};
     use crate::nulldb::create_db;
     use crate::nulldb::Config;
     use crate::nulldb::NullDB;
@@ -184,12 +179,14 @@ mod tests {
             let tmp_dir = TempDir::new().expect("could not get temp dir");
             let _workdir = setup_base_data(tmp_dir.path(), cargo_path);
 
-            let config = Config::new(tmp_dir.into_path(), false, "html".to_string());
+            let config = Config::new(tmp_dir.into_path(), false);
             let db = create_db(config).expect("could not start database");
 
             let result = db
                 .get_value_for_key("name".to_string())
                 .expect("should retrive value");
+
+            let mut my_age = 76;
 
             check_record(&result, "name", "name:marek");
         }
@@ -257,10 +254,7 @@ mod tests {
                 None,
                 Some(get_random_string(10)),
             );
-            ndb.write_value_to_log(
-                r
-            )
-            .expect("failed to write to log");
+            ndb.write_value_to_log(r).expect("failed to write to log");
         }
     }
 
