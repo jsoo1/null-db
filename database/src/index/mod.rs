@@ -1,11 +1,10 @@
+use super::utils::get_generations_segment_mapper;
 use crate::file::file_engine::FileEngine;
 use crate::{errors, nulldb};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-
-use super::utils::get_generations_segment_mapper;
 use std::fs::OpenOptions;
 use std::io::{prelude::*, BufReader};
+use std::path::{Path, PathBuf};
 
 pub type Index = HashMap<String, usize>;
 

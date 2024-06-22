@@ -1,11 +1,8 @@
+use super::{config::RaftConfig, grpcserver::RaftEvent, RaftClients, State};
+use crate::{errors::NullDbReadError, nulldb::NullDB, raft::raft};
+use actix_web::web::Data;
 use log::info;
 use std::time::{Duration, Instant};
-
-use actix_web::web::Data;
-
-use crate::{errors::NullDbReadError, nulldb::NullDB, raft::raft};
-
-use super::{config::RaftConfig, grpcserver::RaftEvent, RaftClients, State};
 
 pub struct LeaderState {
     pub term: u32,

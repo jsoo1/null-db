@@ -1,9 +1,9 @@
-mod candidate;
-pub mod config;
-mod follower;
-pub mod grpcserver;
-mod leader;
+use self::{
+    candidate::CandidateState, follower::FollowerState, grpcserver::RaftEvent, leader::LeaderState,
+};
+use crate::{nulldb::NullDB, raft::grpcserver::RaftGRPCServer};
 use actix_web::web::Data;
+use config::RaftConfig;
 use log::info;
 use raft::raft_server::RaftServer;
 use std::{
@@ -13,15 +13,16 @@ use std::{
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 use tonic::{transport::Server, Status};
+
+mod candidate;
+pub mod config;
+mod follower;
+pub mod grpcserver;
+mod leader;
 pub mod raft {
     tonic::include_proto!("raft");
 }
 
-use self::{
-    candidate::CandidateState, follower::FollowerState, grpcserver::RaftEvent, leader::LeaderState,
-};
-use crate::{nulldb::NullDB, raft::grpcserver::RaftGRPCServer};
-use config::RaftConfig;
 const TIME_OUT: Duration = Duration::from_secs(1);
 
 type RaftClients =

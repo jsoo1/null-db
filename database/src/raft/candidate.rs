@@ -1,15 +1,14 @@
-use actix_web::web::Data;
-use log::info;
-use std::{sync::atomic::Ordering, time::Instant};
-use tokio::sync::oneshot::Receiver;
-
+use super::{config::RaftConfig, grpcserver::RaftEvent, raft::VoteReply, RaftClients, State};
 use crate::{
     errors::NullDbReadError,
     nulldb::NullDB,
     raft::{follower::FollowerState, leader::LeaderState, raft},
 };
+use actix_web::web::Data;
+use log::info;
+use std::{sync::atomic::Ordering, time::Instant};
+use tokio::sync::oneshot::Receiver;
 
-use super::{config::RaftConfig, grpcserver::RaftEvent, raft::VoteReply, RaftClients, State};
 pub struct CandidateState {
     pub has_requested_votes: bool,
     pub yes_votes: i32,

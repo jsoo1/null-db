@@ -1,11 +1,9 @@
+use super::raft::{AppendEntriesReply, AppendEntriesRequest, VoteReply, VoteRequest};
+use crate::{errors::NullDbReadError, file::record::Record};
 use log::info;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
-
-use crate::{errors::NullDbReadError, file::record::Record};
-
-use super::raft::{AppendEntriesReply, AppendEntriesRequest, VoteReply, VoteRequest};
 
 pub struct RaftGRPCServer {
     pub event_sender: Sender<RaftEvent>,

@@ -1,11 +1,8 @@
 use super::errors;
-use super::EasyReader;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fs::File;
 use std::path::{Path, PathBuf};
-
-use std::collections::HashMap;
 
 pub fn get_all_files_by_ext(path: &Path, ext: String) -> std::io::Result<Vec<String>> {
     let paths = std::fs::read_dir(path)?;

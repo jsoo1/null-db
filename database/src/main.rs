@@ -1,6 +1,4 @@
-use env_logger;
-use errors::NullDbReadError;
-use std::path::PathBuf;
+extern crate lazy_static;
 
 use crate::nulldb::create_db;
 use actix_web::{
@@ -8,17 +6,18 @@ use actix_web::{
     web::{self, Data},
     App, HttpResponse, HttpServer, Responder, Result,
 };
-use tokio::sync::mpsc::Sender;
-extern crate lazy_static;
-
-use raft::grpcserver::RaftEvent;
-mod file_reader;
 use clap::Parser;
+use errors::NullDbReadError;
 use file_reader::EasyReader;
 use nulldb::{Config, NullDB};
+use raft::grpcserver::RaftEvent;
+use std::path::PathBuf;
+use tokio::sync::mpsc::Sender;
+
 mod errors;
 mod file;
 mod file_compactor;
+mod file_reader;
 mod index;
 mod nulldb;
 mod raft;

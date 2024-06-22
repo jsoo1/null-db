@@ -1,11 +1,8 @@
-use quick_xml::de::from_str;
-use serde::{Deserialize, Serialize};
-
-use prost::Message;
-
 use super::proto;
 use super::record::{HtmlRecord, JsonRecord, Record};
 use crate::errors::NullDbReadError;
+use prost::Message;
+use quick_xml::de::from_str;
 
 #[derive(Debug, Clone, Copy)]
 pub enum FileEngine {

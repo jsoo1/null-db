@@ -1,11 +1,9 @@
-use actix_web::web::Data;
-use anyhow::anyhow;
-
-use crate::index::generate_index_for_segment;
-use crate::nulldb::NullDB;
-
 use super::file::record;
 use super::utils;
+use crate::index::generate_index_for_segment;
+use crate::nulldb::NullDB;
+use actix_web::web::Data;
+use anyhow::anyhow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
