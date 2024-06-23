@@ -23,16 +23,14 @@ pub enum RaftEvent {
 #[tonic::async_trait]
 impl super::raft::raft_server::Raft for RaftGRPCServer {
     async fn vote(&self, request: Request<VoteRequest>) -> Result<Response<VoteReply>, Status> {
-        info!("Got a request: {:?}", request);
+        info!("Got a request: {request:?}");
         let (sender, receiver) = oneshot::channel();
-        let res = self
-            .event_sender
+
+        self.event_sender
             .send(RaftEvent::VoteRequest(request.into_inner(), sender))
             .await
-            .map_err(|_| Status::internal("Failed to send vote request"));
-        if let Err(_) = res {
-            return Err(Status::internal("Failed to send vote request"));
-        };
+            .map_err(|_| Status::internal("Failed to send vote request"))?;
+
         return Ok(Response::new(
             receiver
                 .await
@@ -44,16 +42,20 @@ impl super::raft::raft_server::Raft for RaftGRPCServer {
         &self,
         request: Request<AppendEntriesRequest>,
     ) -> Result<Response<AppendEntriesReply>, Status> {
-        println!("Got a request: {:?}", request);
+        println!("Got a request: {request:?}");
         let (sender, receiver) = oneshot::channel();
-        let _ = self
-            .event_sender
+
+        // NOTE: This was being ignored on error, which I assume is a bug.
+        // It will now return an error if the send fails.
+        // If this is correct, remove this comment.
+        self.event_sender
             .send(RaftEvent::AppendEntriesRequest(
                 request.into_inner(),
                 sender,
             ))
             .await
-            .map_err(|_| Status::internal("Failed to send append entries request"));
+            .map_err(|_| Status::internal("Failed to send append entries request"))?;
+
         return Ok(Response::new(receiver.await.map_err(|_| {
             Status::internal("Failed to receive append entries reply")
         })?));

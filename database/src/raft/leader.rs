@@ -23,8 +23,8 @@ impl LeaderState {
         if self.last_heartbeat.elapsed() > Duration::from_millis(100) {
             info!("Sending heartbeat");
             self.last_heartbeat = Instant::now();
-            let mut clients_clone = { clients.lock().unwrap().clone() };
-            for nodes in clients_clone.values_mut() {
+            let clients_clone = { clients.lock().unwrap().clone() };
+            for mut nodes in clients_clone.into_values() {
                 // Send an empty append entries to all other nodes
                 // This is a heartbeat, so we don't need to send any entries
                 // If the other nodes don't get this they will change state.
@@ -56,7 +56,7 @@ impl LeaderState {
     ) -> Option<State> {
         match message {
             RaftEvent::VoteRequest(request, sender) => {
-                info!("Got a vote request: {:?}", request);
+                info!("Got a vote request: {request:?}");
                 // If the term is greater than the current term, become a follower
                 // this would be the case if a new leader has been elected during split brain
                 if request.term > self.term {
@@ -82,7 +82,7 @@ impl LeaderState {
             // Will append the entries to the log
             // the leader is the only state that can append
             RaftEvent::AppendEntriesRequest(request, sender) => {
-                info!("Got an append entries request: {:?}", request);
+                info!("Got an append entries request: {request:?}");
                 let reply = raft::AppendEntriesReply {
                     term: self.term,
                     success: true,
@@ -95,7 +95,7 @@ impl LeaderState {
             // If a majority of nodes have the entry, the leader will send a success message to the client
             // The Leader is the only one that can add entries to the log
             RaftEvent::NewEntry { key, value, sender } => {
-                info!("Got a new entry: {}:{}", key, value);
+                info!("Got a new entry: {key}:{value}");
 
                 // Add the entry to the log (the database)
                 let res = log.log(key.clone(), value.clone(), self.log_index);
@@ -142,8 +142,8 @@ impl LeaderState {
             }
             RaftEvent::GetEntry(key, sender) => {
                 println!("Got a get entry request: {:?}", key);
-                if let Ok(entry) = log.get_value_for_key(key) {
-                    sender.send(Ok(entry.clone())).unwrap();
+                if let Ok(entry) = log.get_value_for_key(&key) {
+                    sender.send(Ok(entry)).unwrap();
                 } else {
                     sender.send(Err(NullDbReadError::ValueNotFound)).unwrap();
                 }

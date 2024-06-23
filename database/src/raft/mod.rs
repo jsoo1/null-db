@@ -19,7 +19,10 @@ pub mod config;
 mod follower;
 pub mod grpcserver;
 mod leader;
+
 pub mod raft {
+    #![allow(clippy::module_inception)]
+
     tonic::include_proto!("raft");
 }
 
@@ -58,7 +61,7 @@ impl RaftNode {
         // Start the gRPC server
         let port = self.config.candidate_id.clone();
         tokio::spawn(async move {
-            let res = start_raft_server(port, sender).await;
+            let res = start_raft_server(&port, sender).await;
             if let Err(e) = res {
                 println!("Error: {:?}", e);
             }
@@ -68,14 +71,10 @@ impl RaftNode {
         let raft_clients = self.raft_clients.clone();
         let config = self.config.clone();
         tokio::spawn(async move {
-            for node in config.roster.clone() {
-                let nameport = node.split(":").collect::<Vec<&str>>();
-                let ip = format!(
-                    "http://{}:{}",
-                    nameport[0].to_string(),
-                    nameport[1].to_string()
-                );
-                info!("Connecting to {}", ip);
+            for node in config.roster {
+                let nameport = node.split(':').collect::<Vec<&str>>();
+                let ip = format!("http://{}:{}", nameport[0], nameport[1]);
+                info!("Connecting to {ip}");
 
                 // try to connect to the node
                 // if it fails, the node is not up yet
@@ -87,7 +86,7 @@ impl RaftNode {
                         if let Ok(raft_client) = raft_client {
                             {
                                 let mut raft_clients = raft_clients_clone.lock().unwrap();
-                                raft_clients.insert(node.to_string(), raft_client);
+                                raft_clients.insert(node, raft_client);
                             }
                             break;
                         }
@@ -135,12 +134,10 @@ impl RaftNode {
             .state
             .tick(&self.config, self.log.clone(), self.raft_clients.clone())
             .await;
-        if state.is_some() {
-            return state;
-        }
 
-        // If no state transition is needed, return None
-        None
+        #[allow(clippy::let_and_return)]
+        // If state is None, then this fn returns None and no state transition is needed
+        state
     }
 
     /// Transition to a new state if needed.
@@ -193,15 +190,15 @@ impl State {
 
 /// Start raft gRPC server
 pub async fn start_raft_server(
-    port: String,
+    port: &str,
     sender: Sender<RaftEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let raft_server = RaftGRPCServer {
         event_sender: sender,
     };
-    let addr = format!("0.0.0.0:{}", port).parse().unwrap();
+    let addr = format!("0.0.0.0:{port}").parse().unwrap();
     let server = RaftServer::new(raft_server);
     Server::builder().add_service(server).serve(addr).await?;
-    println!("Raft server listening on: {}", addr);
+    println!("Raft server listening on: {addr}");
     Ok(())
 }

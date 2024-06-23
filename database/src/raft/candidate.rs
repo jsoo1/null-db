@@ -38,7 +38,7 @@ impl CandidateState {
         // Lets hold an election for ourselves
 
         // Get all the clients for the nodes in the cluster
-        let mut clients_clone = { clients.lock().unwrap().clone() };
+        let clients_clone = { clients.lock().unwrap().clone() };
         let num_clients = clients_clone.len() as i32;
 
         // If we haven't requested votes yet, lets do it!
@@ -46,7 +46,7 @@ impl CandidateState {
         // if we don't get enough votes we will become a candidate again in the next term.
         if !self.has_requested_votes {
             info!("Sending vote requests to all nodes");
-            for node in clients_clone.values_mut() {
+            for mut node in clients_clone.into_values() {
                 let request = tonic::Request::new(raft::VoteRequest {
                     term: self.current_term,
                     candidate_id: config.candidate_id.clone(),
@@ -54,13 +54,12 @@ impl CandidateState {
                     last_log_term: self.current_term,
                 });
 
-                info!("Sending vote request to node: {:?}", node);
+                info!("Sending vote request to node: {node:?}");
                 let (sender, receiver) = tokio::sync::oneshot::channel();
                 self.votes.push(receiver);
-                let mut n = node.clone();
                 tokio::spawn(async move {
-                    info!("inside spawn: {:?}", n);
-                    let response = n.vote(request).await.unwrap().into_inner();
+                    info!("inside spawn: {node:?}");
+                    let response = node.vote(request).await.unwrap().into_inner();
                     sender.send(response).unwrap();
                 });
             }
@@ -72,8 +71,7 @@ impl CandidateState {
         let mut voters = vec![];
         while let Some(mut vote) = self.votes.pop() {
             info!("Checking vote inner loop");
-            let response = vote.try_recv();
-            let Ok(response) = response else {
+            let Ok(response) = vote.try_recv() else {
                 info!("Vote not ready");
                 voters.push(vote);
                 continue;
@@ -123,7 +121,7 @@ impl CandidateState {
         match message {
             // If we get a vote request, we should vote no because we are a candidate
             RaftEvent::VoteRequest(request, sender) => {
-                info!("vote request: {:?}", request);
+                info!("vote request: {request:?}");
                 info!("voting no");
                 let reply = raft::VoteReply {
                     term: self.current_term,
@@ -133,7 +131,7 @@ impl CandidateState {
             }
             // If we get an append entries request, we should save the data and become a follower
             RaftEvent::AppendEntriesRequest(request, sender) => {
-                info!("Got an append entries request: {:?}", request);
+                info!("Got an append entries request: {request:?}");
                 let res = log.log_entries(
                     request.entries,
                     log.current_raft_index
@@ -141,8 +139,8 @@ impl CandidateState {
                 );
 
                 // If the append failed, return failure to the leader
-                if res.is_err() {
-                    println!("Failed to append entries: {:?}", res.err().unwrap());
+                if let Err(e) = res {
+                    println!("Failed to append entries: {e:?}");
                     let reply = raft::AppendEntriesReply {
                         term: self.current_term,
                         success: false,
@@ -173,16 +171,13 @@ impl CandidateState {
                 value,
                 sender,
             } => {
-                info!("Got a new entry, not the leader. Entry value: {:?}", value);
-                let _ = sender.send(Err(NullDbReadError::NotLeader)).unwrap();
+                info!("Got a new entry, not the leader. Entry value: {value:?}");
+                sender.send(Err(NullDbReadError::NotLeader)).unwrap();
             }
 
             // Get entry request can only be handled by the leader
             RaftEvent::GetEntry(key, sender) => {
-                info!(
-                    "Got a request for a value, not the leader rejecting: {:?}",
-                    key
-                );
+                info!("Got a request for a value, not the leader rejecting: {key:?}");
                 sender.send(Err(NullDbReadError::NotLeader)).unwrap();
             }
         }

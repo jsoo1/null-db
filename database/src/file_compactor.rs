@@ -18,8 +18,8 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{thread, time};
 
-pub const SEGMENT_FILE_EXT: &'static str = "nullsegment";
-const MAX_FILE_SIZE: &'static usize = &(1 * 1024); //1kb block
+pub const SEGMENT_FILE_EXT: &str = "nullsegment";
+const MAX_FILE_SIZE: usize = 1024; //1kb block
 
 pub async fn start_compaction(rx: Receiver<i32>, db: Data<NullDB>) {
     thread::spawn(move || loop {
@@ -33,7 +33,7 @@ pub async fn start_compaction(rx: Receiver<i32>, db: Data<NullDB>) {
         let ret = compactor(db.clone());
 
         if ret.is_err() {
-            println!("Error compacting {:?}", ret);
+            println!("Error compacting {ret:?}");
         }
 
         println!("Suspending...");
@@ -42,23 +42,22 @@ pub async fn start_compaction(rx: Receiver<i32>, db: Data<NullDB>) {
 }
 
 pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
-    let segment_files =
-        utils::get_all_files_by_ext(db.get_db_path().as_path(), SEGMENT_FILE_EXT.to_owned())?;
+    let segment_files = utils::get_all_files_by_ext(&db.get_db_path(), SEGMENT_FILE_EXT)?;
 
     // stores the files for a generation
     let mut gen_name_segment_files: HashMap<i32, Vec<String>> = HashMap::new();
     // easy to iterate over list of generations
     let mut generations: HashSet<i32> = HashSet::new();
 
-    let mut iter = segment_files.into_iter();
-    while let Some(file_path) = iter.next_back() {
-        //file names: [gen]-[time].nullsegment
-        let path = file_path.clone();
+    //file names: [gen]-[time].nullsegment
+    for file_path in segment_files.into_iter().rev() {
         /*
          * file names look like this:
          * [generation]-[time].nseg
          */
-        let file_name_breakdown = path.split("-").collect::<Vec<&str>>();
+        let file_name_breakdown = file_path.split('-').collect::<Vec<&str>>();
+
+        // TODO: This will panic if the file name is not in the correct format.
 
         if let Ok(gen_val) = file_name_breakdown[0].parse::<i32>() {
             generations.insert(gen_val);
@@ -83,9 +82,6 @@ pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
     let data: &mut HashSet<record::Record> = &mut HashSet::new();
     let mut compacted_files: Vec<PathBuf> = Vec::new();
 
-    //Umm... I don't know if this is the best way to do this. it's what I did though, help me?
-    let mut gen_iter = gen_vec.into_iter();
-
     let main_log_file_name = match db.get_main_log() {
         Ok(f) => f,
         Err(e) => {
@@ -97,54 +93,51 @@ pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
         }
     };
 
-    while let Some(current_gen) = gen_iter.next_back() {
-        println!("Gen {} in progress!", current_gen);
+    for current_gen in gen_vec.into_iter().rev() {
+        println!("Gen {current_gen} in progress!");
         /*
          * Power of rust, we KNOW that this is safe because we just built it...
          * but it's better to check anyhow... sometimes annoying but.
          */
         if let Some(file_name_vec) = gen_name_segment_files.get_mut(&current_gen) {
             file_name_vec.sort_unstable();
-            let mut file_name_iter = file_name_vec.into_iter();
             // iterate over each file in the generation
             // This is the opisite of the "get value" function as we want to go oldest to newest!
-            while let Some(file_path) = file_name_iter.next() {
+            for file_path in file_name_vec {
                 //file names: [gen]-[time].nullsegment
-                let path = db.get_path_for_file(format!("{}-{}", current_gen, file_path.clone()));
+                let path = db.get_path_for_file(format!("{current_gen}-{file_path}"));
                 if path == main_log_file_name {
                     println!("Skipping main log file");
                     continue;
                 };
-                println!("{:?}", path);
+                println!("{path:?}");
 
                 let file = OpenOptions::new()
                     .read(true)
                     .write(false)
-                    .open(path.clone())
+                    .open(&path)
                     .expect("db pack file doesn't exist.");
 
                 // Read file into buffer reader
                 let f = BufReader::new(file);
-                // break it into lines
-                let lines = f.lines();
-
-                // insert each line into our set.
-                for line in lines {
-                    if let Ok(l) = line {
-                        // need to use our hashing object so only the "key" is looked at. pretty cool.
-                        // have no idea why i'm so excited about this one single bit.
-                        // this is what makes software engineering fun.
-                        if let Ok(record) = db.get_file_engine().deserialize(&l) {
-                            data.replace(record);
-                        }
+                // break it into lines and insert each line into our set.
+                // TODO: In the event there is a read error, flatten will read in a loop forever.
+                // I'm not convinced the code previously did not exhibit this behavior, so I'm leaving flatten
+                // in place, where clippy points out the issue.
+                for line in f.lines().flatten() {
+                    // need to use our hashing object so only the "key" is looked at. pretty cool.
+                    // have no idea why i'm so excited about this one single bit.
+                    // this is what makes software engineering fun.
+                    if let Ok(record) = db.get_file_engine().deserialize(&line) {
+                        data.replace(record);
                     }
                 }
 
-                compacted_files.push(path.clone());
+                compacted_files.push(path);
 
                 // If we are over our max file size, lets flush to disk
                 // for now, we will just check at the end of each file.
-                if mem::size_of_val(&data) > *MAX_FILE_SIZE {
+                if mem::size_of_val(data) > MAX_FILE_SIZE {
                     // Calculate file generation
                     let file_gen = current_gen + 1;
                     println!("===========I DO NOT RUN============");
@@ -152,16 +145,17 @@ pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
                     // Create new file
                     let mut new_file = OpenOptions::new()
                         .write(true)
+                        .truncate(false)
                         .create(true)
-                        .open(new_segment_name.clone())
+                        .open(&new_segment_name)
                         .unwrap();
 
                     // interesting we don't "care" about the order now
                     // becuase all records are unique
                     for r in data.iter() {
                         let rec = r.serialize();
-                        if let Err(e) = new_file.write_all(rec.as_slice()) {
-                            eprintln!("Couldn't write to file: {}", e);
+                        if let Err(e) = new_file.write_all(&rec) {
+                            eprintln!("Couldn't write to file: {e}");
                         }
                     }
 
@@ -171,14 +165,13 @@ pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
                         panic!("could not generate index of compacted file");
                     };
                     db.add_index(new_segment_name.clone(), index);
-                    println!("saved new segment index: {:?}", new_segment_name.clone());
+                    println!("saved new segment index: {new_segment_name:?}");
 
-                    eprintln!("files to be deleted: {:?}", compacted_files);
+                    eprintln!("files to be deleted: {compacted_files:?}");
                     for f in &compacted_files {
                         db.remove_index(f);
-                        let res = fs::remove_file(f.clone());
-                        if res.is_err() {
-                            println!("Failed to delete old file:{:?}", res)
+                        if let Err(e) = fs::remove_file(f) {
+                            println!("Failed to delete old file:{e:?}")
                         }
                     }
 
@@ -195,7 +188,7 @@ pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
      * Same as above, just need to check if there is some data left over at the end
      * We will just flush it to a file. no problem.
      */
-    if mem::size_of_val(&data) > 0 {
+    if mem::size_of_val(data) > 0 {
         // Calculate file generation
         let file_gen = 1;
 
@@ -204,6 +197,7 @@ pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
         // Create new file
         let mut new_file = OpenOptions::new()
             .write(true)
+            .truncate(false)
             .create(true)
             .open(new_segment_name.clone())
             .unwrap();
@@ -212,8 +206,8 @@ pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
         // becuase all records are unique
         for r in data.iter() {
             let rec = r.serialize();
-            if let Err(e) = new_file.write_all(rec.as_slice()) {
-                eprintln!("Couldn't write to file: {}", e);
+            if let Err(e) = new_file.write_all(&rec) {
+                eprintln!("Couldn't write to file: {e}");
             }
         }
 
@@ -221,29 +215,27 @@ pub fn compactor(db: Data<NullDB>) -> anyhow::Result<()> {
         else {
             panic!("failed to create index for new log segment");
         };
-        db.add_index(new_segment_name.clone(), index);
+        db.add_index(new_segment_name, index);
     }
 
     println!("deleting old logs");
     // delete old compacted files now that the new files are saved to disk.
     for f in &compacted_files {
         db.remove_index(f);
-        let res = fs::remove_file(f);
-        if res.is_err() {
-            println!("Failed to delete old file:{:?}", res)
+        if let Err(e) = fs::remove_file(f) {
+            println!("Failed to delete old file:{e:?}")
         }
     }
 
-    return Ok(());
+    Ok(())
 }
 
 fn generate_segment_file_name(base_path: PathBuf, file_gen: i32) -> PathBuf {
-    let start = SystemTime::now();
-    let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap();
-    let name = format!("{}-{:?}.nullsegment", file_gen, since_the_epoch);
+    let since_the_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Current time is before epoch");
 
-    let mut path = PathBuf::new();
-    path.push(base_path);
-    path.push(name);
-    path
+    let name = format!("{file_gen}-{since_the_epoch:?}.nullsegment");
+
+    base_path.join(name)
 }
