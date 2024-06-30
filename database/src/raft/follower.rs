@@ -39,7 +39,7 @@ impl FollowerState {
     pub fn on_message(&mut self, message: RaftEvent, log: Data<NullDB>) -> Option<State> {
         match message {
             RaftEvent::VoteRequest(request, sender) => {
-                info!("Got a vote request: {:?}", request);
+                info!("Got a vote request: {request:?}");
                 // If the request is from a node with a lower term we should vote no.
                 if request.term < self.term {
                     info!("voting no because the term is lower than ours");
@@ -92,8 +92,8 @@ impl FollowerState {
                 );
 
                 // If the append failed, return failure to the leader
-                if res.is_err() {
-                    println!("Failed to append entries: {:?}", res.err().unwrap());
+                if let Err(e) = res {
+                    println!("Failed to append entries: {e:?}");
                     let reply = raft::AppendEntriesReply {
                         term: self.term,
                         success: false,
@@ -118,16 +118,13 @@ impl FollowerState {
                 value,
                 sender,
             } => {
-                info!("Got a new entry, not the leader. Entry value: {:?}", value);
-                let _ = sender.send(Err(NullDbReadError::NotLeader)).unwrap();
+                info!("Got a new entry, not the leader. Entry value: {value:?}");
+                sender.send(Err(NullDbReadError::NotLeader)).unwrap();
             }
 
             // Get entry request can only be handled by the leader
             RaftEvent::GetEntry(key, sender) => {
-                info!(
-                    "Got a request for a value, not the leader rejecting: {:?}",
-                    key
-                );
+                info!("Got a request for a value, not the leader rejecting: {key:?}");
                 sender.send(Err(NullDbReadError::NotLeader)).unwrap();
             }
         }

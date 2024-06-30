@@ -1,7 +1,4 @@
 [workspace]
+resolver = "2"
 
-members = [
-    "cli",
-    "database",
-    "experiments/iocost", "html-test",
-]
+members = ["cli", "database", "experiments/iocost", "html-test"]

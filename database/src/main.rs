@@ -1,24 +1,21 @@
-use env_logger;
-use errors::NullDbReadError;
-use std::path::PathBuf;
-
 use crate::nulldb::create_db;
 use actix_web::{
     delete, get, post,
     web::{self, Data},
     App, HttpResponse, HttpServer, Responder, Result,
 };
-use tokio::sync::mpsc::Sender;
-extern crate lazy_static;
-
-use raft::grpcserver::RaftEvent;
-mod file_reader;
 use clap::Parser;
+use errors::NullDbReadError;
 use file_reader::EasyReader;
 use nulldb::{Config, NullDB};
+use raft::grpcserver::RaftEvent;
+use std::path::PathBuf;
+use tokio::sync::mpsc::Sender;
+
 mod errors;
 mod file;
 mod file_compactor;
+mod file_reader;
 mod index;
 mod nulldb;
 mod raft;
@@ -44,21 +41,30 @@ struct Args {
 #[actix_web::main]
 async fn main() -> Result<(), std::io::Error> {
     env_logger::init();
-    let args = Args::parse();
+    let Args {
+        compaction,
+        dir,
+        roster,
+        id,
+        encoding,
+    } = Args::parse();
 
-    let nodes = args.roster.split(",").collect::<Vec<&str>>();
+    let nodes = roster.split(",").map(Into::into).collect::<Vec<String>>();
 
     let (sender, receiver) = tokio::sync::mpsc::channel(1000);
-    let config = Config::new(args.dir, args.compaction, args.encoding.clone());
-    let raft_config = raft::config::RaftConfig::new(args.id.clone(), nodes.clone());
+    let config = Config::new(dir, compaction, encoding);
+    let raft_config = raft::config::RaftConfig {
+        roster: nodes,
+        candidate_id: id,
+    };
     let db_mutex = create_db(config).expect("could not start db");
-    let mut raft = raft::RaftNode::new(raft_config, receiver, db_mutex.clone());
+    let mut raft = raft::RaftNode::new(raft_config, receiver, db_mutex);
     let tx = sender.clone();
     tokio::spawn(async move {
         let _ = raft.run(tx).await;
     });
 
-    let sender_ark = Data::new(sender.clone());
+    let sender_ark = Data::new(sender);
     println!("starting web server");
     HttpServer::new(move || {
         App::new()
@@ -69,7 +75,7 @@ async fn main() -> Result<(), std::io::Error> {
             .service(compact_data)
             .service(get_index)
     })
-    .bind(format!("0.0.0.0:8080"))?
+    .bind("0.0.0.0:8080")?
     .run()
     .await
 }
@@ -89,12 +95,12 @@ async fn get_value_for_key(
     let _ret = sender.send(event).await;
     match receiver.await {
         Err(e) => {
-            HttpResponse::InternalServerError().body(format!("Issue getting value for key: {}", e))
+            HttpResponse::InternalServerError().body(format!("Issue getting value for key: {e}"))
         }
         Ok(value) => match value {
             Ok(res) => HttpResponse::Ok().body(res.get_value().unwrap_or("No Value".to_string())),
             Err(e) => HttpResponse::InternalServerError()
-                .body(format!("Issue getting value for key: {}", e)),
+                .body(format!("Issue getting value for key: {e}")),
         },
     }
 }
@@ -110,11 +116,11 @@ pub async fn put_value_for_key(
     key: web::Path<String>,
     req_body: String,
 ) -> impl Responder {
-    println!("putting data {}", req_body);
+    println!("putting data {req_body}");
     let (tx, receiver) = tokio::sync::oneshot::channel();
     let event = RaftEvent::NewEntry {
-        key: key.clone(),
-        value: req_body.clone(),
+        key: key.into_inner(),
+        value: req_body,
         sender: tx,
     };
     let _ = sender.send(event).await;
@@ -122,14 +128,14 @@ pub async fn put_value_for_key(
     let ret = receiver.await;
 
     match ret {
-        Err(e) => HttpResponse::InternalServerError().body(format!("Issue writing: {}", e)),
+        Err(e) => HttpResponse::InternalServerError().body(format!("Issue writing: {e}")),
         Ok(res) => match res {
-            Ok(_) => HttpResponse::Ok().body("Record written".to_string()),
+            Ok(_) => HttpResponse::Ok().body("Record written"),
             Err(e) => match e {
                 NullDbReadError::NotLeader => {
                     HttpResponse::MisdirectedRequest().body("I'm not the leader")
                 }
-                _ => HttpResponse::InternalServerError().body(format!("Issue writing")),
+                _ => HttpResponse::InternalServerError().body("Issue writing"),
             },
         },
     }
@@ -137,9 +143,9 @@ pub async fn put_value_for_key(
 
 #[delete("v1/data/{key}")]
 pub async fn delete_value_for_key(db: Data<NullDB>, key: web::Path<String>) -> impl Responder {
-    let ret = db.delete_record(key.clone());
+    let ret = db.delete_record(key.into_inner());
     match ret {
-        Err(e) => HttpResponse::InternalServerError().body(format!("Issue deleting: {}", e)),
+        Err(e) => HttpResponse::InternalServerError().body(format!("Issue deleting: {e}")),
         Ok(_) => HttpResponse::Ok().body("It has been deleted!"),
     }
 }
@@ -147,9 +153,9 @@ pub async fn delete_value_for_key(db: Data<NullDB>, key: web::Path<String>) -> i
 #[get("/v1/management/compact")]
 pub async fn compact_data(db: Data<NullDB>) -> impl Responder {
     println!("compacting!");
-    let res = file_compactor::compactor(db.clone());
+    let res = file_compactor::compactor(db);
 
-    if let Ok(_) = res {
+    if res.is_ok() {
         return HttpResponse::Ok();
     }
 
@@ -182,9 +188,7 @@ mod tests {
             let config = Config::new(tmp_dir.into_path(), false);
             let db = create_db(config).expect("could not start database");
 
-            let result = db
-                .get_value_for_key("name".to_string())
-                .expect("should retrive value");
+            let result = db.get_value_for_key("name").expect("should retrive value");
 
             let mut my_age = 76;
 
@@ -203,17 +207,15 @@ mod tests {
             let db = create_db(config).expect("could not start database");
 
             put_lots_of_data(&db, 10000, db.get_file_engine());
-            let result = db
-                .get_value_for_key("name".to_string())
-                .expect("should retrive value");
+            let result = db.get_value_for_key("name").expect("should retrive value");
 
             check_record(&result, "name", "name:marek");
         }
     }
 
     fn check_record(record: &Record, key: &str, value: &str) {
-        assert_eq!(record.get_key(), key);
-        assert_eq!(record.get_value().unwrap(), value);
+        assert_eq!(record.as_key(), key);
+        assert!(matches!(record.as_value(), Some(rv) if rv == value));
     }
 
     #[test]
@@ -236,9 +238,7 @@ mod tests {
             }
 
             let start = std::time::Instant::now();
-            let _result = db
-                .get_value_for_key("name".to_string())
-                .expect("should retrive value");
+            let _result = db.get_value_for_key("name").expect("should retrive value");
             let end = (std::time::Instant::now() - start).as_nanos();
             println!("get value for name duration nanos: {}", end);
         }

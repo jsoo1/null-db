@@ -1,11 +1,11 @@
-use quick_xml::de::from_str;
-use serde::{Deserialize, Serialize};
-
-use prost::Message;
+use std::str::FromStr;
 
 use super::proto;
 use super::record::{HtmlRecord, JsonRecord, Record};
 use crate::errors::NullDbReadError;
+use anyhow::anyhow;
+use prost::Message;
+use quick_xml::de::from_str;
 
 #[derive(Debug, Clone, Copy)]
 pub enum FileEngine {
@@ -14,18 +14,22 @@ pub enum FileEngine {
     Proto,
 }
 
-/// FileEngine is an enum that represents the different file engines that can be used to store records.
-impl FileEngine {
+impl FromStr for FileEngine {
+    type Err = anyhow::Error;
+
     /// new creates a new FileEngine from a string, valid options are json, html and proto.
-    pub fn new(engine: &str) -> Self {
-        match engine {
-            "json" => FileEngine::Json,
-            "html" => FileEngine::Html,
-            "proto" => FileEngine::Proto,
-            _ => panic!("Invalid file engine"),
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "json" => Ok(FileEngine::Json),
+            "html" => Ok(FileEngine::Html),
+            "proto" => Ok(FileEngine::Proto),
+            _ => Err(anyhow!("Invalid file engine")),
         }
     }
+}
 
+/// FileEngine is an enum that represents the different file engines that can be used to store records.
+impl FileEngine {
     /// deserialize a string into a Record.
     ///
     /// # Errors
@@ -35,16 +39,16 @@ impl FileEngine {
         match self {
             FileEngine::Json => {
                 let json: JsonRecord =
-                    serde_json::from_str(value).map_err(|e| NullDbReadError::Corrupted)?;
+                    serde_json::from_str(value).map_err(|_e| NullDbReadError::Corrupted)?;
                 Ok(Record::Json(json))
             }
             FileEngine::Html => {
-                let html: HtmlRecord = from_str(value).map_err(|e| NullDbReadError::Corrupted)?;
+                let html: HtmlRecord = from_str(value).map_err(|_e| NullDbReadError::Corrupted)?;
                 Ok(Record::Html(html))
             }
             FileEngine::Proto => {
                 let proto: proto::ProtoRecord = proto::ProtoRecord::decode(value.as_bytes())
-                    .map_err(|e| NullDbReadError::Corrupted)?;
+                    .map_err(|_e| NullDbReadError::Corrupted)?;
                 Ok(Record::Proto(proto))
             }
         }

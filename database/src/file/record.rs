@@ -83,7 +83,15 @@ impl Record {
         }
     }
 
-    /// get_key returns the key of the record.
+    pub fn as_key(&self) -> &str {
+        match self {
+            Record::Json(json) => &json.key,
+            Record::Html(html) => &html.key,
+            Record::Proto(proto) => &proto.key,
+        }
+    }
+
+    /// to_key returns a clone of the recored's key.
     pub fn get_key(&self) -> String {
         match self {
             Record::Json(json) => json.key.clone(),
@@ -107,19 +115,21 @@ impl Record {
             Record::Json(json) => json.tombstone,
             Record::Proto(proto) => proto.tombstone,
             Record::Html(html) => match &html.class {
-                Some(class) => {
-                    if class == "tombstone" {
-                        Some(true)
-                    } else {
-                        None
-                    }
-                }
-                None => None,
+                Some(class) if class == "tombstone" => Some(true),
+                Some(_) | None => None,
             },
         }
     }
 
-    /// get_value returns the value of the record.
+    pub fn as_value(&self) -> Option<&str> {
+        match self {
+            Record::Json(json) => json.value.as_deref(),
+            Record::Html(html) => html.value.as_deref(),
+            Record::Proto(proto) => proto.value.as_deref(),
+        }
+    }
+
+    /// get_value returns a clone of the recored's value.
     pub fn get_value(&self) -> Option<String> {
         match self {
             Record::Json(json) => json.value.clone(),
