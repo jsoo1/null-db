@@ -1,7 +1,7 @@
 use super::{grpcserver::RaftEvent, State, TIME_OUT};
 use crate::{
     errors::NullDbReadError,
-    nulldb::NullDB,
+    nulldb::{DatabaseLog, NullDB},
     raft::{candidate::CandidateState, raft},
 };
 use actix_web::web::Data;
@@ -36,7 +36,11 @@ impl FollowerState {
     }
 
     /// on_message, when in followers state, only handles vote requests and append entries requests
-    pub fn on_message(&mut self, message: RaftEvent, log: Data<NullDB>) -> Option<State> {
+    pub fn on_message<T: DatabaseLog>(
+        &mut self,
+        message: RaftEvent,
+        log: Data<T>,
+    ) -> Option<State> {
         match message {
             RaftEvent::VoteRequest(request, sender) => {
                 info!("Got a vote request: {request:?}");
@@ -51,6 +55,7 @@ impl FollowerState {
                     // we will stay a follower
                     return None;
                 }
+
                 // if we have not already voted, vote yes
                 if !self.voted {
                     info!("voting yes");
@@ -85,11 +90,7 @@ impl FollowerState {
             RaftEvent::AppendEntriesRequest(request, sender) => {
                 info!("Got an append entries request!");
                 // Append the entries to the log
-                let res = log.log_entries(
-                    request.entries,
-                    log.current_raft_index
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
+                let res = log.log_entries(request.entries, log.get_current_raft_index());
 
                 // If the append failed, return failure to the leader
                 if let Err(e) = res {

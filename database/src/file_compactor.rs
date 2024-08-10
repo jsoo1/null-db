@@ -1,7 +1,7 @@
 use super::file::record;
 use super::utils;
 use crate::index::generate_index_for_segment;
-use crate::nulldb::NullDB;
+use crate::nulldb::{DatabaseLog, NullDB};
 use actix_web::web::Data;
 use anyhow::anyhow;
 use std::collections::HashMap;

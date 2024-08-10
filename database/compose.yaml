@@ -1,45 +1,34 @@
 services:
   node1:
     build: .
-    command: 'null-db --roster=node2:3001,node3:3002 --id=3000 --encoding=json'
-    environment:
-      - RUST_LOG=info
-    ports:
-      - 3000:3000
-      - 30001:8080
-    volumes:
-      - ./node1:/db
-    develop:
-      watch:
-        - action: rebuild
-          path: . 
-
-  node2:
-    build: .
-    command: 'null-db --roster=node1:3000,node3:3002 --id=3001 --encoding=json'
+    command: "null-db --roster=node1:3001,node2:3002,node3:3003 --id=node1:3001 --encoding=json"
     environment:
       - RUST_LOG=info
     ports:
       - 3001:3001
-      - 30011:8080
+      - 30001:8080
     volumes:
-      - ./node2:/db
-    develop:
-      watch:
-        - action: rebuild
-          path: . 
+      - ./node1:/db
 
-  node3:
+  node2:
     build: .
-    command: 'null-db --roster=node2:3001,node1:3000 --id=3002 --encoding=json'
+    command: "null-db --roster=node1:3001,node2:3002,node3:3003 --id=node2:3002 --encoding=json"
     environment:
       - RUST_LOG=info
     ports:
       - 3002:3002
-      - 30021:8080
+      - 30002:8080
+    volumes:
+      - ./node2:/db
+
+  node3:
+    build: .
+    command: "null-db --roster=node1:3001,node2:3002,node3:3003 --id=node3:3003 --encoding=json"
+    environment:
+      - RUST_LOG=info
+    ports:
+      - 3003:3003
+      - 30003:8080
     volumes:
       - ./node3:/db
     develop:
-      watch:
-        - action: rebuild
-          path: . 

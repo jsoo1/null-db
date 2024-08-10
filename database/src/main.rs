@@ -7,10 +7,14 @@ use actix_web::{
 use clap::Parser;
 use errors::NullDbReadError;
 use file_reader::EasyReader;
-use nulldb::{Config, NullDB};
+use nulldb::{Config, DatabaseLog, NullDB};
 use raft::grpcserver::RaftEvent;
-use std::path::PathBuf;
-use tokio::sync::mpsc::Sender;
+use std::{path::PathBuf, time::Duration};
+use tokio::{
+    signal::unix::{signal, SignalKind},
+    sync::mpsc::Sender,
+};
+use tokio_util::sync::CancellationToken;
 
 mod errors;
 mod file;
@@ -25,20 +29,30 @@ mod utils;
 #[clap(author, version, about, long_about = None)]
 struct Args {
     #[clap(short, long)]
+    #[arg(default_value = "false")]
     compaction: bool,
+
     #[clap(short, long)]
     #[arg(default_value=get_work_dir().into_os_string())]
     dir: PathBuf,
+
     #[clap(short, long)]
-    roster: String,
+    roster: Option<String>,
+
     #[clap(short, long)]
+    #[arg(default_value = "localhost:3000")]
     id: String,
+
     #[clap(short, long)]
     #[arg(default_value = "html")]
     encoding: String,
+
+    #[clap(short, long)]
+    #[arg(default_value = "8080")]
+    port: u16,
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     env_logger::init();
     let Args {
@@ -47,9 +61,10 @@ async fn main() -> Result<(), std::io::Error> {
         roster,
         id,
         encoding,
+        port,
     } = Args::parse();
 
-    let nodes = roster.split(",").map(Into::into).collect::<Vec<String>>();
+    let nodes = parse_roster(roster);
 
     let (sender, receiver) = tokio::sync::mpsc::channel(1000);
     let config = Config::new(dir, compaction, encoding);
@@ -57,14 +72,47 @@ async fn main() -> Result<(), std::io::Error> {
         roster: nodes,
         candidate_id: id,
     };
+
+    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+    let mut sigquit = signal(SignalKind::quit()).unwrap();
+    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    let tx = sender.clone();
+    let sender_ark = Data::new(sender);
+
     let db_mutex = create_db(config).expect("could not start db");
     let mut raft = raft::RaftNode::new(raft_config, receiver, db_mutex);
-    let tx = sender.clone();
+    let db_thread = tokio::spawn(async move {
+        let _ = raft.run(tx, cancel_clone).await;
+    });
+    println!("listening for signals");
     tokio::spawn(async move {
-        let _ = raft.run(tx).await;
+        tokio::select! {
+            _ = sigterm.recv() => {
+                println!("Received SIGTERM");
+                cancel.cancel();
+                db_thread.await.unwrap();
+            }
+            _ = sigint.recv() => {
+                println!("Received SIGINT");
+                cancel.cancel();
+                db_thread.await.unwrap();
+            }
+            _ = sigquit.recv() => {
+                println!("Received SIGQUIT");
+                cancel.cancel();
+                db_thread.await.unwrap();
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("Received ctrl_c");
+                cancel.cancel();
+                db_thread.await.unwrap();
+            }
+        }
     });
 
-    let sender_ark = Data::new(sender);
     println!("starting web server");
     HttpServer::new(move || {
         App::new()
@@ -75,9 +123,17 @@ async fn main() -> Result<(), std::io::Error> {
             .service(compact_data)
             .service(get_index)
     })
-    .bind("0.0.0.0:8080")?
+    .bind(format!("0.0.0.0:{port}"))?
     .run()
-    .await
+    .await;
+    Ok(())
+}
+
+fn parse_roster(roster: Option<String>) -> Option<Vec<String>> {
+    match roster {
+        Some(r) => Some(r.split(",").map(Into::into).collect::<Vec<String>>()),
+        None => None,
+    }
 }
 
 fn get_work_dir() -> PathBuf {
@@ -116,7 +172,6 @@ pub async fn put_value_for_key(
     key: web::Path<String>,
     req_body: String,
 ) -> impl Responder {
-    println!("putting data {req_body}");
     let (tx, receiver) = tokio::sync::oneshot::channel();
     let event = RaftEvent::NewEntry {
         key: key.into_inner(),
@@ -185,7 +240,7 @@ mod tests {
             let tmp_dir = TempDir::new().expect("could not get temp dir");
             let _workdir = setup_base_data(tmp_dir.path(), cargo_path);
 
-            let config = Config::new(tmp_dir.into_path(), false);
+            let config = Config::new(tmp_dir.into_path(), false, "html".to_string());
             let db = create_db(config).expect("could not start database");
 
             let result = db.get_value_for_key("name").expect("should retrive value");

@@ -1,6 +1,7 @@
 use super::{config::RaftConfig, grpcserver::RaftEvent, raft::VoteReply, RaftClients, State};
 use crate::{
     errors::NullDbReadError,
+    nulldb::DatabaseLog,
     nulldb::NullDB,
     raft::{follower::FollowerState, leader::LeaderState, raft},
 };
@@ -117,7 +118,11 @@ impl CandidateState {
         None
     }
 
-    pub fn on_message(&mut self, message: RaftEvent, log: Data<NullDB>) -> Option<State> {
+    pub fn on_message<T: DatabaseLog>(
+        &mut self,
+        message: RaftEvent,
+        log: Data<T>,
+    ) -> Option<State> {
         match message {
             // If we get a vote request, we should vote no because we are a candidate
             RaftEvent::VoteRequest(request, sender) => {
@@ -132,11 +137,7 @@ impl CandidateState {
             // If we get an append entries request, we should save the data and become a follower
             RaftEvent::AppendEntriesRequest(request, sender) => {
                 info!("Got an append entries request: {request:?}");
-                let res = log.log_entries(
-                    request.entries,
-                    log.current_raft_index
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
+                let res = log.log_entries(request.entries, log.get_current_raft_index());
 
                 // If the append failed, return failure to the leader
                 if let Err(e) = res {

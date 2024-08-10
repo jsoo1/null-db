@@ -1,9 +1,11 @@
 use clap::{Parser, Subcommand};
-use rand::distributions::{Alphanumeric};
+use futures::stream::{self, StreamExt};
+use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use std::convert::TryInto;
 use std::{thread, time};
-
+use tokio::io::AsyncRead;
+use tokio::sync::SemaphorePermit;
 mod null_client;
 
 #[derive(Parser)]
@@ -55,6 +57,13 @@ enum Commands {
         host: String,
     },
 
+    BenchDisk {
+        #[clap(long, default_value = "localhost")]
+        host: String,
+        #[clap(long, default_value = "8001")]
+        port: String,
+    },
+
     Compact {
         #[clap(long, default_value = "localhost")]
         host: String,
@@ -79,9 +88,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
 
     match &args.command {
-        Commands::Put { key, value, host, port } => {
+        Commands::Put {
+            key,
+            value,
+            host,
+            port,
+        } => {
             println!("putting data {}", value);
-            println!("connecting at: {}",format!("http://{}:{}/{}/{}", host, port, "v1/data", key));
+            println!(
+                "connecting at: {}",
+                format!("http://{}:{}/{}/{}", host, port, "v1/data", key)
+            );
             let client = reqwest::Client::new();
             let data = value.clone();
             let resp = client
@@ -111,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Get { key, host, port } => {
             let then = time::Instant::now();
             println!("getting data for key {}", key);
-            let resp = reqwest::get(format!("http://{}:{}/{}/{}\n", host,port, "v1/data", key))
+            let resp = reqwest::get(format!("http://{}:{}/{}/{}\n", host, port, "v1/data", key))
                 .await?
                 .text()
                 .await?;
@@ -142,11 +159,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             benchmark(*records, *duration, host.to_string()).await;
         }
 
+        Commands::BenchDisk { host, port } => {
+            println!("benchmarking disk");
+            load_disks(1_000, 32, host.to_string(), port.to_string()).await;
+        }
+
         Commands::Compact { host, port } => {
             println!("Making a compation request!");
             let _resp = reqwest::get(format!(
                 "http://{}:{}/{}\n",
-                host,port, "v1/management/compact"
+                host, port, "v1/management/compact"
             ))
             .await?
             .text()
@@ -202,6 +224,23 @@ async fn benchmark(records: i32, duration: i32, host: String) -> Option<()> {
     return Some(());
 }
 
+async fn load_disks(records: u32, threads: u32, host: String, port: String) {
+    let client = null_client::NullClient::new(format!("http://{host}:{port}/v1/data").to_string());
+
+    let _ = futures::stream::iter(0..records)
+        .map(|_| {
+            let c = client.clone();
+            tokio::spawn(async move {
+                let _ = c.post(
+                "testdata".to_string(),
+                "This is the value of our record, it's awesome, not super short but kind of short."
+                    .to_string()).await;
+            })
+        })
+        .buffered(threads as usize)
+        .count()
+        .await;
+}
 fn get_random_string(length: usize) -> String {
     let chars: Vec<u8> = rand::thread_rng()
         .sample_iter(&Alphanumeric)

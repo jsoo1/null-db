@@ -1,5 +1,6 @@
 use reqwest::{Error, Response};
 
+#[derive(Debug, Clone)]
 pub struct NullClient {
     url: String,
     client: reqwest::Client,

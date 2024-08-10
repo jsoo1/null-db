@@ -1,5 +1,9 @@
 use super::{config::RaftConfig, grpcserver::RaftEvent, RaftClients, State};
-use crate::{errors::NullDbReadError, nulldb::NullDB, raft::raft};
+use crate::{
+    errors::NullDbReadError,
+    nulldb::{DatabaseLog, NullDB},
+    raft::raft,
+};
 use actix_web::web::Data;
 use log::info;
 use std::time::{Duration, Instant};
@@ -47,12 +51,12 @@ impl LeaderState {
         None
     }
 
-    pub async fn on_message(
+    pub async fn on_message<T: DatabaseLog>(
         &mut self,
         message: RaftEvent,
         config: &RaftConfig,
         clients: RaftClients,
-        log: Data<NullDB>,
+        log: Data<T>,
     ) -> Option<State> {
         match message {
             RaftEvent::VoteRequest(request, sender) => {
@@ -131,8 +135,14 @@ impl LeaderState {
                     }
                 }
 
+                // If there is no roster, we are running in single node mode and have reach consensus
+                let Some(roster) = config.roster.clone() else {
+                    sender.send(Ok(())).unwrap();
+                    return None;
+                };
+
                 // If a majority of nodes have the entry, send a success message to the client
-                if success > config.roster.len() / 2 {
+                if success > roster.len() / 2 {
                     sender.send(Ok(())).unwrap();
                 } else {
                     sender

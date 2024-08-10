@@ -7,6 +7,7 @@ use crate::EasyReader;
 use crate::{errors, file_compactor, utils};
 use actix_web::web::Data;
 use anyhow::anyhow;
+use log::info;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::BufRead;
@@ -67,23 +68,334 @@ pub fn create_db(config: Config) -> anyhow::Result<Data<NullDB>> {
     Ok(db_arc)
 }
 
-impl NullDB {
-    pub fn get_db_path(&self) -> PathBuf {
+pub trait DatabaseLog {
+    fn get_db_path(&self) -> PathBuf;
+    fn get_path_for_file(&self, file_name: String) -> PathBuf;
+    fn get_file_engine(&self) -> FileEngine;
+    fn get_main_log(&self) -> anyhow::Result<PathBuf>;
+    fn delete_record(&self, key: String) -> Result<(), NullDbReadError>;
+    fn get_latest_record_from_disk(&self) -> Result<Record, errors::NullDbReadError>;
+    fn get_value_for_key(&self, key: &str) -> Result<Record, errors::NullDbReadError>;
+    fn log(&self, key: String, value: String, index: u64) -> anyhow::Result<(), NullDbReadError>;
+    fn log_entries(
+        &self,
+        entries: Vec<LogEntry>,
+        index: u64,
+    ) -> anyhow::Result<(), NullDbReadError>;
+    fn write_value_to_log(&self, record: Record) -> Result<(), NullDbReadError>;
+    fn add_index(&self, segment: PathBuf, index: Index) -> Option<Index>;
+    fn remove_index(&self, segment: &Path) -> Option<Index>;
+    fn get_current_raft_index(&self) -> u64;
+}
+
+impl DatabaseLog for NullDB {
+    fn get_current_raft_index(&self) -> u64 {
+        self.current_raft_index.load(Ordering::Relaxed)
+    }
+
+    fn get_db_path(&self) -> PathBuf {
         let Ok(config) = self.config.read() else {
-            println!("could not get readlock on config!");
+            info!("could not get readlock on config!");
             panic!("we have poisiod our locks");
         };
         config.path.clone()
     }
 
-    pub fn get_path_for_file(&self, file_name: String) -> PathBuf {
+    fn get_path_for_file(&self, file_name: String) -> PathBuf {
         self.get_db_path().join(file_name)
     }
 
-    pub fn get_file_engine(&self) -> FileEngine {
+    fn get_file_engine(&self) -> FileEngine {
         self.file_engine
     }
 
+    // gets name of main log file "right now" does not hold read lock so value maybe be stale
+    fn get_main_log(&self) -> anyhow::Result<PathBuf> {
+        let Ok(main_log) = self.main_log_mutex.read() else {
+            return Err(anyhow!("Could not get main log file!"));
+        };
+
+        Ok(main_log.clone())
+    }
+
+    // Deletes a record from the log
+    fn delete_record(&self, key: String) -> Result<(), NullDbReadError> {
+        self.write_value_to_log(
+            self.file_engine
+                .new_tombstone_record(key, self.current_raft_index.load(Ordering::Relaxed)),
+        )
+    }
+
+    fn get_latest_record_from_disk(&self) -> Result<Record, errors::NullDbReadError> {
+        let Ok(config) = self.config.read() else {
+            info!("could not get readlock on config!");
+            panic!("we have poisiod our locks");
+        };
+        // If not in main log, check all the segments
+        let mut generation_mapper =
+            utils::get_generations_segment_mapper(&config.path, file_compactor::SEGMENT_FILE_EXT)?;
+
+        /*
+         * unstable is faster, but could reorder "same" values.
+         * We will not have same values as this was from a set.
+         */
+        let mut gen_vec: Vec<i32> = generation_mapper.generations.into_iter().collect();
+        gen_vec.sort_unstable();
+
+        //Umm... I don't know if this is the best way to do this. it's what I did though, help me?
+        // TODO: main_log_filename is never used. If there is a reason for testing the lock, it should be documented.
+        let Ok(main_log_filename) = self.main_log_mutex.read() else {
+            panic!("we have poisiod our locks... don't do this please");
+        };
+
+        for current_gen in gen_vec {
+            info!("Gen {current_gen} in progress");
+            /*
+             * Power of rust, we KNOW that this is safe because we just built it...
+             * but it's better to check anyhow... sometimes annoying but.
+             */
+            if let Some(file_name_vec) = generation_mapper
+                .gen_name_segment_files
+                .get_mut(&current_gen)
+            {
+                file_name_vec.sort_unstable();
+
+                // TODO: The comment below seems to suggest that time should be included in the file name,
+                // but it is not. What is the correct behavior?
+                let then = time::Instant::now();
+
+                // TODO: Clippy is very mad here because the loop is never looping. Is this the intended behavior?
+                for file_path in file_name_vec.into_iter().rev() {
+                    //file names: [gen]-[time].nullsegment
+                    let path = self.get_path_for_file(format!("{current_gen}-{file_path}"));
+
+                    return get_value_from_segment(&path, 0, self.file_engine);
+                }
+            }
+        }
+        Err(errors::NullDbReadError::ValueNotFound)
+    }
+
+    fn get_value_for_key(&self, key: &str) -> Result<Record, errors::NullDbReadError> {
+        // Aquire read lock on main log in memory
+        let Ok(main_log) = self.main_log_memory_mutex.read() else {
+            info!("Could not get main log file!");
+            panic!("we have poisiod our locks");
+        };
+
+        // Check the main log first for key
+        if let Some(value) = main_log.get(key) {
+            info!(
+                "Returned value from main info! {}, {}",
+                value.as_key(),
+                value.as_value().unwrap()
+            );
+            return Ok(value.clone());
+        }
+
+        let Ok(config) = self.config.read() else {
+            info!("could not get readlock on config!");
+            panic!("we have poisiod our locks");
+        };
+        // If not in main log, check all the segments
+        let mut generation_mapper =
+            utils::get_generations_segment_mapper(&config.path, file_compactor::SEGMENT_FILE_EXT)?;
+
+        /*
+         * unstable is faster, but could reorder "same" values.
+         * We will not have same values as this was from a set.
+         */
+        let mut gen_vec: Vec<i32> = generation_mapper.generations.into_iter().collect();
+        gen_vec.sort_unstable();
+
+        //Umm... I don't know if this is the best way to do this. it's what I did though, help me?ms
+        let Ok(main_log_filename) = self.main_log_mutex.read() else {
+            panic!("we have poisiod our locks... don't do this please");
+        };
+
+        for current_gen in gen_vec {
+            info!("Gen {current_gen} in progress");
+            /*
+             * Power of rust, we KNOW that this is safe because we just built it...
+             * but it's better to check anyhow... sometimes annoying but.
+             */
+            if let Some(file_name_vec) = generation_mapper
+                .gen_name_segment_files
+                .get_mut(&current_gen)
+            {
+                file_name_vec.sort_unstable();
+
+                let then = time::Instant::now();
+
+                for file_path in file_name_vec.iter_mut().rev() {
+                    //file names: [gen]-[time].nullsegment
+                    let path = self.get_path_for_file(format!("{current_gen}-{file_path}"));
+
+                    // Don't check the main log, we already did that.
+                    if path == *main_log_filename {
+                        continue;
+                    }
+
+                    //Check index for value
+                    let Ok(log_index) = self.log_indexes.read() else {
+                        panic!("could not optain read log on indexes");
+                    };
+
+                    let index = log_index.get(&path);
+
+                    let Some(index) = index else {
+                        info!("{log_index:?}");
+                        info!("{path:?}");
+                        panic!("Index not found for log segment");
+                    };
+
+                    let Some(line_number) = index.get(key) else {
+                        continue;
+                    };
+
+                    info!("record found, file:{path:?}, line_number:{line_number}");
+                    let dur: u128 = (time::Instant::now() - then).as_millis();
+                    info!("inner dur: {dur}");
+                    return get_value_from_segment(&path, *line_number, self.file_engine);
+                }
+            }
+        }
+        Err(errors::NullDbReadError::ValueNotFound)
+    }
+
+    fn log(&self, key: String, value: String, index: u64) -> anyhow::Result<(), NullDbReadError> {
+        let tmp_index = index + 1;
+        let new_record = self
+            .file_engine
+            .new_record(key, tmp_index, None, Some(value));
+        self.write_value_to_log(new_record)?;
+        Ok(())
+    }
+
+    fn log_entries(
+        &self,
+        entries: Vec<LogEntry>,
+        index: u64,
+    ) -> anyhow::Result<(), NullDbReadError> {
+        let mut tmp_index = index + 1;
+        for entry in entries {
+            let new_record =
+                self.file_engine
+                    .new_record(entry.key, tmp_index, None, Some(entry.value));
+            self.write_value_to_log(new_record)?;
+            tmp_index += 1;
+        }
+
+        Ok(())
+    }
+
+    // Writes value to log, will create new log if over 64 lines.
+    fn write_value_to_log(&self, record: Record) -> Result<(), NullDbReadError> {
+        let line_count = {
+            let main_log = self.main_log_mutex.read();
+            let Ok(main_log) = main_log else {
+                info!("Could not get main log file!");
+                return Err(NullDbReadError::FailedToObtainMainLog);
+            };
+            let file = File::open(&*main_log).map_err(|e| {
+                info!("Could not open main log file! error: {e}");
+                NullDbReadError::IOError(e)
+            })?;
+            // make new file if over our 64 lines max
+            let f = BufReader::new(file);
+            f.lines().count()
+        };
+
+        // Check if main log is "full"
+        if line_count > 5120 {
+            let main_log = self.main_log_mutex.write();
+            let Ok(mut main_log) = main_log else {
+                return Err(NullDbReadError::FailedToObtainMainLog);
+            };
+            let Some(index) = index::generate_index_for_segment(&main_log, self.file_engine) else {
+                panic!("could not create index of main log");
+            };
+            self.add_index(main_log.clone(), index);
+
+            let Ok(mut main_memory_log) = self.main_log_memory_mutex.write() else {
+                info!("Could not get main log file!");
+                panic!("we have poisiod our locks");
+            };
+
+            // Check the main log first for key
+            main_memory_log.clear();
+            let Ok(config) = self.config.read() else {
+                info!("could not get readlock on config!");
+                panic!("we have poisiod our locks");
+            };
+            *main_log = Self::create_next_segment_file(config.path.clone()).map_err(|e| {
+                info!("Could not create new main log file! error: {e}");
+                NullDbReadError::IOError(e)
+            })?;
+        }
+
+        // Aquire write lock on main log file
+        let Ok(_main_log_disk) = self.main_log_file_mutex.write() else {
+            return Err(NullDbReadError::FailedToObtainMainLog);
+        };
+
+        // Aquire write lock on main log memory
+        let Ok(mut main_log_memory) = self.main_log_memory_mutex.write() else {
+            return Err(NullDbReadError::FailedToObtainMainLog);
+        };
+
+        // Aquire read lock on main log file name
+        let Ok(main_log_name) = self.main_log_mutex.read() else {
+            return Err(NullDbReadError::FailedToObtainMainLog);
+        };
+
+        // Write to memory
+        let old_value = main_log_memory.insert(record.get_key(), record.clone());
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&*main_log_name)
+            .map_err(|e| {
+                info!("Could not open main log file! error: {e}");
+                NullDbReadError::IOError(e)
+            })?;
+
+        // TODO: Could write partial record to file then fail. need to try and clean up disk
+        let rec = record.serialize();
+
+        if let Err(e) = file.write_all(&rec) {
+            return file_write_error(&mut main_log_memory, old_value, record, e);
+        }
+
+        if let Err(e) = file.write_all(b"\n") {
+            return file_write_error(&mut main_log_memory, old_value, record, e);
+        }
+
+        if let Err(e) = file.flush() {
+            return file_write_error(&mut main_log_memory, old_value, record, e);
+        }
+
+        Ok(())
+    }
+
+    fn add_index(&self, segment: PathBuf, index: Index) -> Option<Index> {
+        let Ok(mut main_index) = self.log_indexes.write() else {
+            panic!("could not optain write lock to index");
+        };
+
+        main_index.insert(segment, index)
+    }
+
+    fn remove_index(&self, segment: &Path) -> Option<Index> {
+        let Ok(mut main_index) = self.log_indexes.write() else {
+            panic!("could not optain write lock to index");
+        };
+
+        main_index.remove(segment)
+    }
+}
+
+impl NullDB {
     pub fn new(config: Config) -> Result<NullDB, errors::NullDbReadError> {
         let main_log = match Self::create_next_segment_file(config.path.to_owned()) {
             Ok(main_log) => main_log,
@@ -119,296 +431,6 @@ impl NullDB {
         let _file = File::create(&seg_file)?;
         Ok(seg_file)
     }
-
-    // gets name of main log file "right now" does not hold read lock so value maybe be stale
-    pub fn get_main_log(&self) -> anyhow::Result<PathBuf> {
-        let Ok(main_log) = self.main_log_mutex.read() else {
-            return Err(anyhow!("Could not get main log file!"));
-        };
-
-        Ok(main_log.clone())
-    }
-
-    // Deletes a record from the log
-    pub fn delete_record(&self, key: String) -> Result<(), NullDbReadError> {
-        self.write_value_to_log(
-            self.file_engine
-                .new_tombstone_record(key, self.current_raft_index.load(Ordering::Relaxed)),
-        )
-    }
-
-    pub fn get_latest_record_from_disk(&self) -> Result<Record, errors::NullDbReadError> {
-        let Ok(config) = self.config.read() else {
-            println!("could not get readlock on config!");
-            panic!("we have poisiod our locks");
-        };
-        // If not in main log, check all the segments
-        let mut generation_mapper =
-            utils::get_generations_segment_mapper(&config.path, file_compactor::SEGMENT_FILE_EXT)?;
-
-        /*
-         * unstable is faster, but could reorder "same" values.
-         * We will not have same values as this was from a set.
-         */
-        let mut gen_vec: Vec<i32> = generation_mapper.generations.into_iter().collect();
-        gen_vec.sort_unstable();
-
-        //Umm... I don't know if this is the best way to do this. it's what I did though, help me?
-        // TODO: main_log_filename is never used. If there is a reason for testing the lock, it should be documented.
-        let Ok(main_log_filename) = self.main_log_mutex.read() else {
-            panic!("we have poisiod our locks... don't do this please");
-        };
-
-        for current_gen in gen_vec {
-            println!("Gen {current_gen} in progress");
-            /*
-             * Power of rust, we KNOW that this is safe because we just built it...
-             * but it's better to check anyhow... sometimes annoying but.
-             */
-            if let Some(file_name_vec) = generation_mapper
-                .gen_name_segment_files
-                .get_mut(&current_gen)
-            {
-                file_name_vec.sort_unstable();
-
-                // TODO: The comment below seems to suggest that time should be included in the file name,
-                // but it is not. What is the correct behavior?
-                let then = time::Instant::now();
-
-                // TODO: Clippy is very mad here because the loop is never looping. Is this the intended behavior?
-                for file_path in file_name_vec.into_iter().rev() {
-                    //file names: [gen]-[time].nullsegment
-                    let path = self.get_path_for_file(format!("{current_gen}-{file_path}"));
-
-                    return get_value_from_segment(&path, 0, self.file_engine);
-                }
-            }
-        }
-        Err(errors::NullDbReadError::ValueNotFound)
-    }
-
-    pub fn get_value_for_key(&self, key: &str) -> Result<Record, errors::NullDbReadError> {
-        // Aquire read lock on main log in memory
-        let Ok(main_log) = self.main_log_memory_mutex.read() else {
-            println!("Could not get main log file!");
-            panic!("we have poisiod our locks");
-        };
-
-        // Check the main log first for key
-        if let Some(value) = main_log.get(key) {
-            println!(
-                "Returned value from main log! {}, {}",
-                value.as_key(),
-                value.as_value().unwrap()
-            );
-            return Ok(value.clone());
-        }
-
-        let Ok(config) = self.config.read() else {
-            println!("could not get readlock on config!");
-            panic!("we have poisiod our locks");
-        };
-        // If not in main log, check all the segments
-        let mut generation_mapper =
-            utils::get_generations_segment_mapper(&config.path, file_compactor::SEGMENT_FILE_EXT)?;
-
-        /*
-         * unstable is faster, but could reorder "same" values.
-         * We will not have same values as this was from a set.
-         */
-        let mut gen_vec: Vec<i32> = generation_mapper.generations.into_iter().collect();
-        gen_vec.sort_unstable();
-
-        //Umm... I don't know if this is the best way to do this. it's what I did though, help me?ms
-        let Ok(main_log_filename) = self.main_log_mutex.read() else {
-            panic!("we have poisiod our locks... don't do this please");
-        };
-
-        for current_gen in gen_vec {
-            println!("Gen {current_gen} in progress");
-            /*
-             * Power of rust, we KNOW that this is safe because we just built it...
-             * but it's better to check anyhow... sometimes annoying but.
-             */
-            if let Some(file_name_vec) = generation_mapper
-                .gen_name_segment_files
-                .get_mut(&current_gen)
-            {
-                file_name_vec.sort_unstable();
-
-                let then = time::Instant::now();
-
-                for file_path in file_name_vec.iter_mut().rev() {
-                    //file names: [gen]-[time].nullsegment
-                    let path = self.get_path_for_file(format!("{current_gen}-{file_path}"));
-
-                    // Don't check the main log, we already did that.
-                    if path == *main_log_filename {
-                        continue;
-                    }
-
-                    //Check index for value
-                    let Ok(log_index) = self.log_indexes.read() else {
-                        panic!("could not optain read log on indexes");
-                    };
-
-                    let index = log_index.get(&path);
-
-                    let Some(index) = index else {
-                        println!("{log_index:?}");
-                        println!("{path:?}");
-                        panic!("Index not found for log segment");
-                    };
-
-                    let Some(line_number) = index.get(key) else {
-                        continue;
-                    };
-
-                    println!("record found, file:{path:?}, line_number:{line_number}");
-                    let dur: u128 = (time::Instant::now() - then).as_millis();
-                    println!("inner dur: {dur}");
-                    return get_value_from_segment(&path, *line_number, self.file_engine);
-                }
-            }
-        }
-        Err(errors::NullDbReadError::ValueNotFound)
-    }
-
-    pub fn log(
-        &self,
-        key: String,
-        value: String,
-        index: u64,
-    ) -> anyhow::Result<(), NullDbReadError> {
-        let tmp_index = index + 1;
-        let new_record = self
-            .file_engine
-            .new_record(key, tmp_index, None, Some(value));
-        self.write_value_to_log(new_record)?;
-        Ok(())
-    }
-
-    pub fn log_entries(
-        &self,
-        entries: Vec<LogEntry>,
-        index: u64,
-    ) -> anyhow::Result<(), NullDbReadError> {
-        let mut tmp_index = index + 1;
-        for entry in entries {
-            let new_record =
-                self.file_engine
-                    .new_record(entry.key, tmp_index, None, Some(entry.value));
-            self.write_value_to_log(new_record)?;
-            tmp_index += 1;
-        }
-
-        Ok(())
-    }
-
-    // Writes value to log, will create new log if over 64 lines.
-    pub fn write_value_to_log(&self, record: Record) -> Result<(), NullDbReadError> {
-        let line_count = {
-            let main_log = self.main_log_mutex.read();
-            let Ok(main_log) = main_log else {
-                println!("Could not get main log file!");
-                return Err(NullDbReadError::FailedToObtainMainLog);
-            };
-            let file = File::open(&*main_log).map_err(|e| {
-                println!("Could not open main log file! error: {e}");
-                NullDbReadError::IOError(e)
-            })?;
-            // make new file if over our 64 lines max
-            let f = BufReader::new(file);
-            f.lines().count()
-        };
-
-        // Check if main log is "full"
-        if line_count > 5120 {
-            let main_log = self.main_log_mutex.write();
-            let Ok(mut main_log) = main_log else {
-                return Err(NullDbReadError::FailedToObtainMainLog);
-            };
-            let Some(index) = index::generate_index_for_segment(&main_log, self.file_engine) else {
-                panic!("could not create index of main log");
-            };
-            self.add_index(main_log.clone(), index);
-
-            let Ok(mut main_memory_log) = self.main_log_memory_mutex.write() else {
-                println!("Could not get main log file!");
-                panic!("we have poisiod our locks");
-            };
-
-            // Check the main log first for key
-            main_memory_log.clear();
-            let Ok(config) = self.config.read() else {
-                println!("could not get readlock on config!");
-                panic!("we have poisiod our locks");
-            };
-            *main_log = Self::create_next_segment_file(config.path.clone()).map_err(|e| {
-                println!("Could not create new main log file! error: {e}");
-                NullDbReadError::IOError(e)
-            })?;
-        }
-
-        // Aquire write lock on main log file
-        let Ok(_main_log_disk) = self.main_log_file_mutex.write() else {
-            return Err(NullDbReadError::FailedToObtainMainLog);
-        };
-
-        // Aquire write lock on main log memory
-        let Ok(mut main_log_memory) = self.main_log_memory_mutex.write() else {
-            return Err(NullDbReadError::FailedToObtainMainLog);
-        };
-
-        // Aquire read lock on main log file name
-        let Ok(main_log_name) = self.main_log_mutex.read() else {
-            return Err(NullDbReadError::FailedToObtainMainLog);
-        };
-
-        // Write to memory
-        let old_value = main_log_memory.insert(record.get_key(), record.clone());
-
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&*main_log_name)
-            .map_err(|e| {
-                println!("Could not open main log file! error: {e}");
-                NullDbReadError::IOError(e)
-            })?;
-
-        // TODO: Could write partial record to file then fail. need to try and clean up disk
-        let rec = record.serialize();
-
-        if let Err(e) = file.write_all(&rec) {
-            return file_write_error(&mut main_log_memory, old_value, record, e);
-        }
-
-        if let Err(e) = file.write_all(b"\n") {
-            return file_write_error(&mut main_log_memory, old_value, record, e);
-        }
-
-        if let Err(e) = file.flush() {
-            return file_write_error(&mut main_log_memory, old_value, record, e);
-        }
-
-        Ok(())
-    }
-
-    pub fn add_index(&self, segment: PathBuf, index: Index) -> Option<Index> {
-        let Ok(mut main_index) = self.log_indexes.write() else {
-            panic!("could not optain write lock to index");
-        };
-
-        main_index.insert(segment, index)
-    }
-
-    pub fn remove_index(&self, segment: &Path) -> Option<Index> {
-        let Ok(mut main_index) = self.log_indexes.write() else {
-            panic!("could not optain write lock to index");
-        };
-
-        main_index.remove(segment)
-    }
 }
 
 fn file_write_error(
@@ -418,7 +440,7 @@ fn file_write_error(
     e: io::Error,
 ) -> Result<(), NullDbReadError> {
     // TODO: Could write partial record to file then fail. need to try and clean up disk
-    println!("Could not open main log file! error: {e}");
+    info!("Could not open main log file! error: {e}");
     // If we failed to write to disk, reset the memory to what it was before
     if let Some(old_value) = old_value {
         main_log.insert(record.get_key(), old_value);
@@ -455,7 +477,7 @@ pub fn get_value_from_database(
     file_engine: FileEngine,
 ) -> Result<Record, errors::NullDbReadError> {
     file_engine.deserialize(value).map_err(|e| {
-        println!("Could not parse value from database! error: {e}");
+        info!("Could not parse value from database! error: {e}");
         errors::NullDbReadError::Corrupted
     })
 }

@@ -2,7 +2,7 @@ use self::{
     candidate::CandidateState, follower::FollowerState, grpcserver::RaftEvent, leader::LeaderState,
 };
 use crate::{nulldb::NullDB, raft::grpcserver::RaftGRPCServer};
-use actix_web::web::Data;
+use actix_web::web::{to, Data};
 use config::RaftConfig;
 use log::info;
 use raft::raft_server::RaftServer;
@@ -11,7 +11,9 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio_util::sync::CancellationToken;
 use tonic::{transport::Server, Status};
 
 mod candidate;
@@ -45,8 +47,12 @@ pub struct RaftNode {
 impl RaftNode {
     /// Create a new RaftNode with a configuration, a receiver and a log.
     pub fn new(config: RaftConfig, receiver: Receiver<RaftEvent>, log: Data<NullDB>) -> Self {
+        let state = match config.roster {
+            Some(_) => State::Follower(FollowerState::new(Instant::now(), 0)),
+            None => State::Leader(LeaderState::new(Instant::now(), 0)),
+        };
         Self {
-            state: State::Follower(FollowerState::new(Instant::now(), 0)),
+            state,
             raft_clients: Arc::new(Mutex::new(HashMap::new())),
             log,
             config,
@@ -57,10 +63,16 @@ impl RaftNode {
     /// Run the RaftNode.
     /// This function will start the gRPC server, connect to all other nodes and
     /// start the main loop of the RaftNode.
-    pub async fn run(&mut self, sender: Sender<RaftEvent>) -> Result<(), Status> {
+    pub async fn run(
+        &mut self,
+        sender: Sender<RaftEvent>,
+        cancel: CancellationToken,
+    ) -> Result<(), Status> {
         // Start the gRPC server
-        let port = self.config.candidate_id.clone();
+        let id = self.config.candidate_id.clone();
         tokio::spawn(async move {
+            let id_vec = id.split(":").collect::<Vec<&str>>();
+            let port = id_vec[1];
             let res = start_raft_server(&port, sender).await;
             if let Err(e) = res {
                 println!("Error: {:?}", e);
@@ -68,40 +80,19 @@ impl RaftNode {
         });
 
         // Connect to all other nodes
-        let raft_clients = self.raft_clients.clone();
         let config = self.config.clone();
-        tokio::spawn(async move {
-            for node in config.roster {
-                let nameport = node.split(':').collect::<Vec<&str>>();
-                let ip = format!("http://{}:{}", nameport[0], nameport[1]);
-                info!("Connecting to {ip}");
-
-                // try to connect to the node
-                // if it fails, the node is not up yet
-                // so we will try again in the next iteration
-                let raft_clients_clone = raft_clients.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let raft_client = raft::raft_client::RaftClient::connect(ip.clone()).await;
-                        if let Ok(raft_client) = raft_client {
-                            {
-                                let mut raft_clients = raft_clients_clone.lock().unwrap();
-                                raft_clients.insert(node, raft_client);
-                            }
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                });
-            }
-        });
+        let raft_clients = self.raft_clients.clone();
+        connect_to_raft_servers(config, raft_clients);
 
         // Main loop
         loop {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let state = self.run_tick().await;
+            if cancel.is_cancelled() {
+                break;
+            }
+            let state = self.tick().await;
             self.next_state(state);
         }
+        Ok(())
     }
 
     /// Run a tick of the RaftNode.
@@ -109,24 +100,23 @@ impl RaftNode {
     /// call the tick function of the current state.
     /// It will return a new state if a transition is needed.
     /// If no transition is needed, it will return None.
-    async fn run_tick(&mut self) -> Option<State> {
+    async fn tick(&mut self) -> Option<State> {
         // Check if there are any messages in the receiver
         // These messages are from the other nodes.
         // If there are messages, call the on_message function of the current state.
-        match self.receiver.try_recv() {
-            Ok(event) => {
-                info!("Got a message");
-                self.state
-                    .on_message(
-                        event,
-                        &self.config,
-                        self.raft_clients.clone(),
-                        self.log.clone(),
-                    )
-                    .await
-            }
-            Err(_) => None,
-        };
+        // TODO: don't needto wait for the message to be processed to start processing the next one
+        // TODO: use a buffer to store the messages to batch?
+        while let Ok(event) = self.receiver.try_recv() {
+            info!("Got a message");
+            self.state
+                .on_message(
+                    event,
+                    &self.config,
+                    self.raft_clients.clone(),
+                    self.log.clone(),
+                )
+                .await;
+        }
 
         // Call the tick function of the current state
         // Tick will check the nodes understanding of the current state of the cluster
@@ -186,6 +176,43 @@ impl State {
             State::Leader(leader) => leader.tick(config, clients).await,
         }
     }
+}
+
+fn connect_to_raft_servers(config: RaftConfig, raft_clients: RaftClients) {
+    tokio::spawn(async move {
+        let Some(roster) = config.roster else {
+            return;
+        };
+
+        for node in roster {
+            // skip the current node
+            if node == config.candidate_id {
+                continue;
+            }
+
+            let nameport = node.split(':').collect::<Vec<&str>>();
+            let ip = format!("http://{}:{}", nameport[0], nameport[1]);
+            info!("Connecting to {ip}");
+
+            // try to connect to the node
+            // if it fails, the node is not up yet
+            // so we will try again in the next iteration
+            let raft_clients_clone = raft_clients.clone();
+            tokio::spawn(async move {
+                loop {
+                    let raft_client = raft::raft_client::RaftClient::connect(ip.clone()).await;
+                    if let Ok(raft_client) = raft_client {
+                        {
+                            let mut raft_clients = raft_clients_clone.lock().unwrap();
+                            raft_clients.insert(node, raft_client);
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            });
+        }
+    });
 }
 
 /// Start raft gRPC server
