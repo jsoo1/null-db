@@ -33,3 +33,7 @@ ENV/
 env.bak/
 venv.bak/
 
+# nix creates symlinks like these after nix-build or nix build.
+# They can be nice to have for reference
+result*
+result*/
