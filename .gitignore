@@ -37,3 +37,5 @@ venv.bak/
 # They can be nice to have for reference
 result*
 result*/
+# Also probably don't need the nixos-test repl history
+.nixos-test-history
