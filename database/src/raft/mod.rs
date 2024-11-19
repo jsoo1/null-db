@@ -225,7 +225,7 @@ pub async fn start_raft_server(
     };
     let addr = format!("0.0.0.0:{port}").parse().unwrap();
     let server = RaftServer::new(raft_server);
-    Server::builder().add_service(server).serve(addr).await?;
     println!("Raft server listening on: {addr}");
+    Server::builder().add_service(server).serve(addr).await?;
     Ok(())
 }
